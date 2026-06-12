@@ -1,0 +1,9 @@
+{
+  "bearerToken": "YOUR_BEARER_TOKEN_HERE",
+  "queryId": "YOUR_QUERY_ID_HERE",
+  "userAgent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+  "cookies": {
+    "auth_token": "YOUR_AUTH_TOKEN_HERE",
+    "ct0": "YOUR_CSRF_TOKEN_HERE"
+  }
+}

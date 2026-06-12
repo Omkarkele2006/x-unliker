@@ -1,0 +1,27 @@
+# Node.js
+node_modules/
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+.pnpm-debug.log*
+
+# Windows
+Thumbs.db
+ehthumbs.db
+Desktop.ini
+
+# VS Code
+.vscode/
+
+# Local credentials & sensitive data
+cookies.json
+like.js
+twitter-archive*
+
+# Script state, logs, and backups
+state/
+*.log
+
+*.tmp
+*.bak
+.DS_Store
