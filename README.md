@@ -19,14 +19,33 @@ I wrote this utility to be practical. It keeps track of progress, respects rate 
 
 ---
 
+## Real-World Run Results
+
+This project was originally built to clean up my own X/Twitter account after discovering I had accumulated more than 133,000 liked tweets over the years.
+
+Final run statistics:
+
+- Tweets processed: 133,863
+- Run sessions: 20
+- Completion rate: 100%
+- Remaining failures: 0
+- Observed throughput: ~1,900 tweets/hour
+- Project duration: June 12–17, 2026
+
+The tool was able to resume across multiple sessions, survive network interruptions, recover from expired credentials, and eventually process the entire archive without data loss.
+
+---
+
 ## Features
 
 - **Local & Private:** No database, no web servers, and no analytics. Your credentials never leave your machine.
 - **Archive Parsing:** Reads your official Twitter archive export files directly, automatically deduplicating tweet IDs and handling multi-part files.
-- **Resilient Queue Management:** Saves state locally in JSON and line-delimited JSON formats so you can close the terminal and pick up right where you left off.
+- **Resilient Queue Management:** Saves state locally in JSON and line-delimited JSON formats so you can close the terminal, resume after crashes or restarts, and pick up right where you left off.
+- **Automatic Retry Handling:** Retries failed requests with exponential backoff and jitter for transient network or session issues.
 - **Rate Limit Aware:** Monitors headers returned by X (`x-rate-limit-remaining` and `x-rate-limit-reset`) to calculate optimal wait windows dynamically.
 - **Circuit Breaker:** Halts execution automatically if it detects systematic failures (like continuous network issues or a revoked browser session) to prevent spamming endpoints.
 - **Interactive Stale Query Handling:** If X deploys an update and changes their internal GraphQL Query ID, the script detects it, tells you how to get the new one, and prompts you to paste it in to continue without having to modify any source code.
+- **Runtime Analytics and Reporting:** Built-in reporting command to analyze log history and output exact runtime execution spans, throughput rates, and pauses.
 - **Dry-Run Mode:** Test your setup first to verify cookies and parse your archive without sending any actual write requests.
 
 ---
@@ -146,6 +165,12 @@ To view advanced execution statistics across all completed runs, including activ
 node unliker.js analytics
 ```
 
+The analytics command reports:
+- **Project Span & Duration**: Total timeline since the first run.
+- **Session Statistics**: Number of separate runs and total active execution time.
+- **Rate-Limit Pauses**: Total occurrences and duration spent waiting on rate limit windows.
+- **Throughput & Efficiency**: Real-world and active processing rates, along with average request intervals.
+
 ---
 
 ## Commands Reference
@@ -167,6 +192,24 @@ node unliker.js analytics
 - **Expired Sessions (HTTP 401 / 403):** If your browser session is terminated or logs out, the script will dump state to files and exit. Grab new cookie values using the steps in the credentials guide, update `cookies.json`, and run the script again.
 - **Stale Query IDs (HTTP 400 / 404):** If Twitter deploys an update, your query ID might become stale. The script will notice this, present clear instructions on how to find the updated query ID, and prompt you to input it directly in your terminal. It will save the new ID to your configuration automatically.
 - **Network Outages:** If your Wi-Fi drops, the script pauses, sleeps with exponential backoff, and retries the request once connection is restored.
+
+---
+
+## Architecture
+
+```
+like.js
+  ↓
+pending queue (state/pending.json)
+  ↓
+GraphQL requests (/i/api/graphql/.../UnfavoriteTweet)
+  ↓
+completed log (state/completed.ndjson)
+  ↓
+analytics (command)
+```
+
+The script parses `like.js` to build a local list of pending tweet IDs. It processes them sequentially using Twitter's internal GraphQL endpoint. Successful requests are logged immediately to a line-delimited JSON file, which serves as the data source for progress tracking and runtime analytics.
 
 ---
 
