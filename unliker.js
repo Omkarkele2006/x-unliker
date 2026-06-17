@@ -1,11 +1,20 @@
 #!/usr/bin/env node
 /**
- * x-unliker - script to unlike all tweets from your archive.
- * 
+ * x-unliker — bulk unlike processor for X/Twitter
+ * Version: 2.0.0 (hardened)
+ *
+ * Source of truth: like.js from Twitter data archive
+ * Transport:       X internal GraphQL  /i/api/graphql/{queryId}/UnfavoriteTweet
+ * Credentials:     cookies exported from logged-in browser session
+ * Persistence:     state/ directory (JSON files + NDJSON log, atomic writes)
+ * Rate limiting:   driven entirely by x-rate-limit-* response headers
+ *
  * Usage:
  *   node unliker.js init --likes ./like.js --cookies ./cookies.json
- *   node unliker.js run
+ *   node unliker.js run [--dry-run] [--max <n>]
  *   node unliker.js status
+ *   node unliker.js retry-failed
+ *   node unliker.js reset
  */
 
 'use strict';
@@ -17,7 +26,8 @@ const crypto = require('crypto');
 const os = require('os');
 const readline = require('readline');
 
-// Config
+// CONFIGURATION
+
 const CONFIG = {
     // Paths
     STATE_DIR: './state',
@@ -28,53 +38,55 @@ const CONFIG = {
     COOKIES_FILE: './cookies.json',
     LOG_FILE: './state/run.log',
 
-    // Rate limiting defaults (fallback if we don't get headers)
+    // Rate limiting — driven by response headers; these are safe fallback defaults
+    // X GraphQL limit: 500 per 15-minute fixed window
     RATE_LIMIT_WINDOW_MS: 15 * 60 * 1000,   // 900,000 ms
     DEFAULT_INTERVAL_MS: 4500,              // ~200 requests/window (40% of limit)
-    MIN_INTERVAL_MS: 1000,              // don't go faster than 1 req/sec
-    MAX_INTERVAL_MS: 60_000,            // wait at most 1 minute
-    RATE_HEADROOM_REQUESTS: 20,                // buffer before hitting rate limit
-    RATE_RESET_BUFFER_MS: 2000,              // safety buffer
+    MIN_INTERVAL_MS: 1000,              // never faster than 1 req/s
+    MAX_INTERVAL_MS: 60_000,            // sanity cap — never slower than 1 req/min
+    RATE_HEADROOM_REQUESTS: 20,                // pause when fewer than 20 remaining
+    RATE_RESET_BUFFER_MS: 2000,              // extra cushion after reset timestamp
 
     // Retry
     MAX_ATTEMPTS_PER_TWEET: 3,
     RETRY_BACKOFF_BASE_MS: 5000,
     RETRY_BACKOFF_MAX_MS: 60_000,
-    RETRY_JITTER_MAX_MS: 2000,             // add some randomness
+    RETRY_JITTER_MAX_MS: 2000,             // max random jitter added to backoff
 
-    // Stop if we get too many errors in a row
+    // Circuit breaker — consecutive unexpected errors before halting
     CIRCUIT_BREAKER_THRESHOLD: 20,
 
-    // Retries for 403 errors
+    // 403 handling — retry this many times before giving up
     MAX_403_RETRIES: 4,
     BACKOFF_403_BASE_MS: 3000,
 
-    // Checkpoint config
+    // Checkpointing
     CHECKPOINT_EVERY_N: 50,               // save checkpoint metadata every N unlikes
 
-    // Batch writes
+    // Completed log batching
     COMPLETED_BATCH_SIZE: 25,               // flush completed entries every N
-    COMPLETED_FLUSH_MS: 10_000,           // flush every 10s
+    COMPLETED_FLUSH_MS: 10_000,           // or every 10 seconds, whichever comes first
 
-    // X API settings
+    // X API
     GRAPHQL_HOST: 'x.com',
     GRAPHQL_PATH_TPL: '/i/api/graphql/{queryId}/UnfavoriteTweet',
-    BEARER_TOKEN: null,                   // loaded from cookies
-    QUERY_ID: null,                   // loaded from checkpoint
+    BEARER_TOKEN: null,                   // loaded from cookies.json
+    QUERY_ID: null,                   // loaded from checkpoint, updated on recovery
 
-    // Safety limits
+    // Safety
     DRY_RUN: false,
-    MAX_PER_RUN: null,                        // null is unlimited
+    MAX_PER_RUN: null,                        // null = unlimited
 };
 
-// Logging
+// LOGGING
+
 let logStream = null;
 
 function initLog() {
     fs.mkdirSync(CONFIG.STATE_DIR, { recursive: true });
     logStream = fs.createWriteStream(CONFIG.LOG_FILE, { flags: 'a' });
     logStream.on('error', (err) => {
-        // don't crash on logging errors
+        // Log stream errors must not crash the process
         console.error(`[LOG STREAM ERROR] ${err.message}`);
     });
 }
@@ -97,7 +109,16 @@ const logger = {
     debug: (m, d) => log('DEBUG', m, d),
 };
 
-// Buffer completed writes to avoid writing to disk every single time
+// COMPLETED LOG — BATCHED WRITE BUFFER
+//
+// Instead of one appendFileSync per entry, we buffer entries in memory
+// and flush periodically. This eliminates 134k individual syscalls and
+// makes the tool resilient to slow / antivirus-scanned storage.
+//
+// Invariant: on any clean or signal-driven shutdown, flushCompletedBuffer()
+// is called before process.exit. The only data loss window is an OS-level
+// crash / power failure between flushes (max COMPLETED_BATCH_SIZE entries).
+
 const completedBuffer = [];
 let completedFlushTimer = null;
 
@@ -106,7 +127,7 @@ function scheduleCompletedFlush() {
     completedFlushTimer = setTimeout(() => {
         flushCompletedBuffer();
     }, CONFIG.COMPLETED_FLUSH_MS);
-    completedFlushTimer.unref(); // let node exit even if timer is active
+    completedFlushTimer.unref(); // don't keep process alive just for this timer
 }
 
 function flushCompletedBuffer() {
@@ -120,7 +141,8 @@ function flushCompletedBuffer() {
     try {
         fs.appendFileSync(CONFIG.COMPLETED_FILE, lines, 'utf8');
     } catch (err) {
-        // failed to write, put entries back to retry later
+        // Disk-full or permission error — log loudly, put entries back in buffer
+        // so they survive the next flush attempt (or are reported at shutdown).
         logger.error('DISK WRITE FAILURE on completed.ndjson — entries buffered for retry', {
             error: err.message,
             code: err.code,
@@ -129,6 +151,7 @@ function flushCompletedBuffer() {
         if (err.code === 'ENOSPC') {
             logger.error('DISK FULL. Free up space and restart — progress is safe.');
         }
+        // Put the unsaved lines back so they're written on next flush or shutdown
         const unsaved = lines.trim().split('\n').map(l => { try { return JSON.parse(l); } catch { return null; } }).filter(Boolean);
         completedBuffer.unshift(...unsaved);
     }
@@ -143,16 +166,21 @@ function queueCompleted(entry) {
     }
 }
 
-// Load already completed IDs so we don't retry them
+// Read all completed IDs from the NDJSON log into a Set.
+// Tolerates malformed lines (skips them) and reports how many were skipped.
 function loadCompletedSet() {
     const completed = new Set();
+    completed.activelyUnlikedCount = 0;
+    completed.alreadyAbsentCount = 0;
+    completed.noopCount = 0;
+
     if (!fs.existsSync(CONFIG.COMPLETED_FILE)) return completed;
 
     let raw;
     try {
         raw = fs.readFileSync(CONFIG.COMPLETED_FILE, 'utf8');
     } catch (err) {
-        logger.warn('Could not read completed.ndjson — starting with empty set', { error: err.message });
+        logger.warn('Failed to read completed.ndjson, initializing empty completed set', { error: err.message });
         return completed;
     }
 
@@ -165,6 +193,13 @@ function loadCompletedSet() {
             const entry = JSON.parse(trimmed);
             if (entry && typeof entry.id === 'string' && entry.id.length > 0) {
                 completed.add(entry.id);
+                if (entry.note === 'not_in_favorites' || entry.note === 'not_found') {
+                    completed.alreadyAbsentCount++;
+                } else if (entry.note === 'noop') {
+                    completed.noopCount++;
+                } else {
+                    completed.activelyUnlikedCount++;
+                }
             } else {
                 malformed++;
             }
@@ -174,31 +209,33 @@ function loadCompletedSet() {
     }
 
     if (malformed > 0) {
-        logger.warn('Malformed entries in completed.ndjson were skipped', { count: malformed });
+        logger.warn('Skipped malformed entries in completed.ndjson', { count: malformed });
     }
 
-    logger.info('Loaded completed set', { count: completed.size, malformed });
+    logger.info('Completed set loaded', { count: completed.size, malformed });
     return completed;
 }
 
-// Write to temp file then rename to avoid corruption if it crashes
+// ATOMIC FILE I/O
+// Write to a temp file then rename — prevents corruption on crash mid-write.
+
 function atomicWriteJSON(filePath, data) {
     const tmp = filePath + '.tmp.' + process.pid;
     try {
         fs.writeFileSync(tmp, JSON.stringify(data, null, 2), 'utf8');
         fs.renameSync(tmp, filePath);
     } catch (err) {
-        // delete temp file if rename failed
+        // Clean up temp file if rename failed
         try { if (fs.existsSync(tmp)) fs.unlinkSync(tmp); } catch (_) { }
         if (err.code === 'ENOSPC') {
-            logger.error('DISK FULL during atomic write — state NOT saved', {
+            logger.error('Atomic write failed: Disk full', {
                 file: filePath,
                 error: err.message,
             });
         } else {
             logger.error('Atomic write failed', { file: filePath, error: err.message });
         }
-        throw err;
+        throw err; // re-throw so callers can handle
     }
 }
 
@@ -207,25 +244,32 @@ function readJSONSafe(filePath, defaultValue) {
         if (!fs.existsSync(filePath)) return defaultValue;
         return JSON.parse(fs.readFileSync(filePath, 'utf8'));
     } catch (e) {
-        logger.warn(`Failed to parse ${filePath}, using default`, { error: e.message });
+        logger.warn(`Failed to parse ${filePath}, using default state`, { error: e.message });
         return defaultValue;
     }
 }
 
-// Expected cookies.json format:
+// CREDENTIAL MANAGEMENT
+//
+// cookies.json format:
 // {
-//   "bearerToken": "...",
-//   "queryId": "...",
-//   "cookies": { "auth_token": "...", "ct0": "..." }
+// "bearerToken": "AAAAAAAAAA...",
+// "queryId":     "ZYKSe-w7KEslx3JhSIk5LA",
+// "cookies": {
+// "auth_token": "...",
+// "ct0":        "...",
+// "guest_id":   "..."   (optional)
 // }
+// }
+
 function protectCredentialsFile(filePath) {
     const platform = os.platform();
     if (platform === 'linux' || platform === 'darwin') {
         try {
             fs.chmodSync(filePath, 0o600);
-            logger.info(`Credentials file permissions set to 600 (owner read/write only)`);
+            logger.info('Credentials file permissions set to 600');
         } catch (err) {
-            logger.warn('Could not chmod credentials file', { error: err.message });
+            logger.warn('Failed to chmod credentials file', { error: err.message });
         }
     } else if (platform === 'win32') {
         logger.warn(
@@ -272,7 +316,8 @@ function buildCookieHeader(cookiesObj) {
         .join('; ');
 }
 
-// Parse like.js from Twitter archive
+// LIKE.JS PARSER
+
 function parseLikeJs(filePath) {
     let content;
     try {
@@ -283,7 +328,9 @@ function parseLikeJs(filePath) {
 
     const allIds = [];
 
-    // Find each JSON array assigned to window.YTD.like.partN
+    // like.js format: window.YTD.like.partN = [ {like: {tweetId: "..."}}, ... ]
+    // There can be multiple part assignments. Find each JSON array separately.
+    // We look for the assignment pattern and extract the JSON array after '='.
     const assignmentRegex = /window\.YTD\.like\.part\d+\s*=\s*(\[[\s\S]*?\]);?\s*(?=window\.|$)/g;
     let matched = false;
     let m;
@@ -299,13 +346,14 @@ function parseLikeJs(filePath) {
                 }
             }
         } catch (err) {
-            logger.warn('Failed to parse a like.js part — skipping', { error: err.message });
+            logger.warn('Failed to parse part in like.js, skipping', { error: err.message });
         }
     }
 
-    // Fallback for older single-array files
+    // Fallback: if the multi-part regex found nothing, try a simple slice from '['
+    // This handles older single-part archive formats.
     if (!matched || allIds.length === 0) {
-        logger.warn('Multi-part regex found no parts — falling back to single-array parse');
+        logger.warn('Multi-part regex match failed, attempting single-array fallback parse');
         const start = content.indexOf('[');
         if (start !== -1) {
             try {
@@ -326,12 +374,12 @@ function parseLikeJs(filePath) {
         throw new Error('No tweet IDs found in like.js. Check the file format.');
     }
 
-    // Remove duplicate IDs
+    // Deduplicate — archive can contain duplicates
     const uniqueSet = new Set(allIds);
     const unique = [...uniqueSet];
     const dupeCount = allIds.length - unique.length;
     if (dupeCount > 0) {
-        logger.info('Deduplicated like.js', { total: allIds.length, unique: unique.length, duplicates: dupeCount });
+        logger.info('Parsed and deduplicated like.js', { total: allIds.length, unique: unique.length, duplicates: dupeCount });
     } else {
         logger.info('Parsed like.js', { total: allIds.length, unique: unique.length });
     }
@@ -339,13 +387,15 @@ function parseLikeJs(filePath) {
     return unique;
 }
 
-// Keep track of rate limits
+// RATE LIMIT STATE
+// Persisted in checkpoint so mid-window restarts don't burst requests.
+
 const rateState = {
     limit: 500,
     remaining: 500,
     resetAt: Date.now() + 900_000,   // estimated; overwritten by first response
 
-    // Parse headers from X
+    // Apply response headers
     update(headers) {
         const limit = headers['x-rate-limit-limit'];
         const remaining = headers['x-rate-limit-remaining'];
@@ -356,7 +406,7 @@ const rateState = {
         if (reset) this.resetAt = parseInt(reset, 10) * 1000;
     },
 
-    // Convert to JSON for saving
+    // Serialize for checkpoint
     toJSON() {
         return {
             limit: this.limit,
@@ -365,23 +415,26 @@ const rateState = {
         };
     },
 
-    // Reload saved rate state if it hasn't reset yet
+    // Restore from checkpoint — only if the reset window hasn't expired.
+    // If the window has already passed, the rate state is stale — use defaults.
     fromJSON(obj) {
         if (!obj) return;
         if (obj.resetAt && obj.resetAt > Date.now()) {
             this.limit = obj.limit ?? 500;
             this.remaining = obj.remaining ?? 500;
             this.resetAt = obj.resetAt;
-            logger.info('Restored rate state from checkpoint', {
+            logger.info('Rate limits loaded from checkpoint', {
                 remaining: this.remaining,
                 resetIn: `${Math.round((this.resetAt - Date.now()) / 1000)}s`,
             });
         } else {
-            logger.info('Checkpoint rate state is from a past window — using defaults');
+            logger.info('Checkpoint rate limits stale; using defaults');
         }
     },
 
-    // Calculate delay based on remaining limit and window reset time
+    // How many ms to wait before the next request.
+    // Spreads remaining budget evenly over remaining window time.
+    // Pauses until reset when budget is near-exhausted.
     nextWaitMs() {
         if (this.remaining <= CONFIG.RATE_HEADROOM_REQUESTS) {
             const waitMs = this.resetAt - Date.now() + CONFIG.RATE_RESET_BUFFER_MS;
@@ -403,7 +456,8 @@ const rateState = {
     },
 };
 
-// API requests
+// HTTP — single GraphQL unlike request
+
 function httpsRequest(options, bodyStr) {
     return new Promise((resolve, reject) => {
         const req = https.request(options, (res) => {
@@ -451,7 +505,9 @@ async function apiUnlikeTweet(tweetId, creds) {
 
     const cookieHeader = buildCookieHeader(creds.cookies);
 
-    // Use user agent from cookies.json or fallback to a default
+    // Use the full UA string from a real Chrome session for authenticity.
+    // The static string below is intentionally generic — replace with the
+    // exact value from your browser's DevTools > Network > request headers.
     const ua =
         creds.userAgent ||
         'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 ' +
@@ -496,12 +552,13 @@ async function apiUnlikeTweet(tweetId, creds) {
     };
 }
 
-// Handle stale query ID
+// STALE QUERY-ID DETECTION
+
 function isStaleQueryIdError(result) {
     if (result.status === 400 || result.status === 404) return true;
-    if (result.errors) {
+    if (result.errors && result.status !== 200) {
         for (const e of result.errors) {
-            // 34 = not found, 214 = endpoint changed or needs flag
+            // 34 = page not found, 214 = requires feature flag / endpoint changed
             if (e.code === 34 || e.code === 214) return true;
         }
     }
@@ -533,7 +590,8 @@ async function promptNewQueryId() {
     });
 }
 
-// Handle session expired
+// SESSION EXPIRY — 401 HANDLING
+
 function printSessionExpiredInstructions() {
     logger.error('');
     logger.error('════════════════════════════════════════════════════');
@@ -564,7 +622,8 @@ function printSessionExpiredInstructions() {
     logger.error('');
 }
 
-// Checkpoints
+// CHECKPOINT MANAGEMENT
+
 function loadCheckpoint() {
     return readJSONSafe(CONFIG.CHECKPOINT_FILE, {
         lastTweetId: null,
@@ -575,7 +634,7 @@ function loadCheckpoint() {
         startedAt: null,
         updatedAt: null,
         runCount: 0,
-        rateState: null,   // saved rate limit state
+        rateState: null,   // persisted rate limit state
     });
 }
 
@@ -586,11 +645,12 @@ function saveCheckpoint(cp) {
         atomicWriteJSON(CONFIG.CHECKPOINT_FILE, cp);
     } catch (err) {
         logger.error('Failed to save checkpoint', { error: err.message });
-        // not fatal, keep going
+        // Non-fatal — we continue running; next checkpoint attempt may succeed
     }
 }
 
-// Utils
+// UTILITIES
+
 function wait(ms) {
     return new Promise((resolve) => setTimeout(resolve, ms));
 }
@@ -608,7 +668,6 @@ function recordFailure(failedMap, tweetId, reason) {
     failedMap[tweetId].lastAttemptAt = new Date().toISOString();
 }
 
-// safeWriteJSON
 function safeWriteJSON(filePath, data, label) {
     try {
         atomicWriteJSON(filePath, data);
@@ -617,7 +676,8 @@ function safeWriteJSON(filePath, data, label) {
     }
 }
 
-// Stop if too many errors in a row
+// CIRCUIT BREAKER
+
 const circuitBreaker = {
     consecutiveUnexpectedErrors: 0,
 
@@ -638,45 +698,46 @@ const circuitBreaker = {
     },
 };
 
-// Main runner
+// MAIN QUEUE PROCESSOR
+
 async function runProcessor(creds) {
-    // Load existing state
+    // Load state
     const checkpoint = loadCheckpoint();
     const completedSet = loadCompletedSet();
     const failedMap = readJSONSafe(CONFIG.FAILED_FILE, {});
     const pending = readJSONSafe(CONFIG.PENDING_FILE, []);
 
     if (pending.length === 0) {
-        logger.info('No pending tweets found. Run `node unliker.js status` to check state.');
+        logger.info('No pending tweets found. Check status using "status" command.');
         return;
     }
 
-    // Restore query ID from checkpoint if needed
+    // Restore queryId from checkpoint if newer
     if (checkpoint.queryId && checkpoint.queryId !== CONFIG.QUERY_ID) {
-        logger.info('Restoring queryId from checkpoint', { queryId: checkpoint.queryId });
+        logger.info('Query ID loaded from checkpoint', { queryId: checkpoint.queryId });
         CONFIG.QUERY_ID = checkpoint.queryId;
         creds.queryId = checkpoint.queryId;
     }
 
-    // Restore rate limit state
+    // Restore rate state from checkpoint
     rateState.fromJSON(checkpoint.rateState);
 
-    // Handle ctrl+c / shutdown
+    // Shutdown flag — set by SIGINT/SIGTERM, checked each loop iteration
     let shutdownRequested = false;
 
     const handleSignal = (signal) => {
-        logger.info(`${signal} received — finishing current request then saving state...`);
+        logger.info(`Signal ${signal} received; finalizing active request and saving state`);
         shutdownRequested = true;
     };
 
-    // only trigger shutdown once
+    // Use once() so the handler doesn't stack on repeated Ctrl+C
     process.once('SIGINT', () => handleSignal('SIGINT'));
     process.once('SIGTERM', () => handleSignal('SIGTERM'));
 
     checkpoint.runCount = (checkpoint.runCount || 0) + 1;
     checkpoint.startedAt = checkpoint.startedAt ?? new Date().toISOString();
 
-    logger.info('Starting run', {
+    logger.info('Starting run...', {
         pending: pending.length,
         completed: completedSet.size,
         failed: Object.keys(failedMap).length,
@@ -685,25 +746,30 @@ async function runProcessor(creds) {
         dryRun: CONFIG.DRY_RUN,
     });
 
-    // Filter out tweets we already unliked
+    // Build effective processing array
+    // Filter out already-completed entries using the completed log as source of truth.
     const pendingArray = pending.filter((id) => !completedSet.has(id));
-    logger.info('Effective pending after dedup against completed log', { count: pendingArray.length });
+    logger.info('Pending queue filtered against completed entries', { count: pendingArray.length });
 
     let pendingIndex = 0;
-    let sessionCount = 0;
+    let processedCount = 0; // tracks max_per_run
+    let sessionUnliked = 0;
+    let sessionAlreadyAbsent = 0;
+    let sessionNoop = 0;
+    let sessionFailed = 0;
     let staleQueryCount = 0;
     let consec403 = 0;   // consecutive 403s before giving up
 
     // Main loop
     while (pendingIndex < pendingArray.length) {
 
-        // Check if user stopped it
+        // Check shutdown flag
         if (shutdownRequested) {
-            logger.info('Shutdown requested — saving state and exiting cleanly.');
+            logger.info('Shutdown signal received; persisting state and exiting');
             break;
         }
 
-        // Stop if too many errors
+        // Circuit breaker
         if (circuitBreaker.isOpen()) {
             logger.error(
                 `Circuit breaker tripped after ${circuitBreaker.describe()}. ` +
@@ -718,37 +784,37 @@ async function runProcessor(creds) {
 
         const tweetId = pendingArray[pendingIndex];
 
-        // Double check we haven't unliked this already
+        // Idempotency double-check
         if (completedSet.has(tweetId)) {
             pendingIndex++;
             continue;
         }
 
-        // Stop if we hit the limit for this run
-        if (CONFIG.MAX_PER_RUN !== null && sessionCount >= CONFIG.MAX_PER_RUN) {
-            logger.info(`Reached MAX_PER_RUN limit of ${CONFIG.MAX_PER_RUN}. Stopping cleanly.`);
+        // MAX_PER_RUN guard
+        if (CONFIG.MAX_PER_RUN !== null && processedCount >= CONFIG.MAX_PER_RUN) {
+            logger.info('MAX_PER_RUN limit reached; stopping execution', { limit: CONFIG.MAX_PER_RUN });
             break;
         }
 
-        // Skip if it failed too many times
+        // Skip permanently-failed tweets
         const failEntry = failedMap[tweetId];
         if (failEntry && failEntry.attempts >= CONFIG.MAX_ATTEMPTS_PER_TWEET) {
-            logger.warn(`Skipping ${tweetId} — exceeded max attempts`, { attempts: failEntry.attempts });
+            logger.warn('Skipping tweet: max attempts exceeded', { tweetId, attempts: failEntry.attempts });
             pendingIndex++;
             continue;
         }
 
-        // Rate limit delay
+        // Rate-limit wait (with verbose logging for long sleeps)
         const waitMs = rateState.nextWaitMs();
         if (waitMs > 0) {
             if (waitMs >= 60_000) {
                 const waitMin = (waitMs / 60_000).toFixed(1);
                 const resetTime = new Date(rateState.resetAt).toISOString();
                 logger.info(
-                    `Rate limit reached — pausing ${waitMin} minutes until window reset at ${resetTime}`,
+                    `Rate limit reached; pausing ${waitMin}m until window reset at ${resetTime}`,
                     { waitMs, rateState: rateState.describe() }
                 );
-                // log status periodically so the user knows it's not frozen
+                // Log status periodically during long sleeps
                 let slept = 0;
                 while (slept < waitMs && !shutdownRequested) {
                     const chunk = Math.min(30_000, waitMs - slept);
@@ -756,46 +822,47 @@ async function runProcessor(creds) {
                     slept += chunk;
                     if (slept < waitMs && !shutdownRequested) {
                         const remaining = Math.round((waitMs - slept) / 1000);
-                        logger.info(`Still paused — ${remaining}s until rate limit resets`);
+                        logger.info(`Still paused: ${remaining}s remaining until window reset`);
                     }
                 }
             } else if (waitMs >= 5_000) {
-                logger.info(`Rate limit pause: ${Math.round(waitMs / 1000)}s — ${rateState.describe()}`);
+                logger.info(`Rate limit pause: ${Math.round(waitMs / 1000)}s`, { rate: rateState.describe() });
                 await wait(waitMs);
             } else {
                 await wait(waitMs);
             }
         }
 
-        // Re-check shutdown
+        // Re-check shutdown after potentially long sleep
         if (shutdownRequested) break;
 
-        // Send request to X
+        // Make the API request
         let result;
         try {
             result = await apiUnlikeTweet(tweetId, creds);
         } catch (networkErr) {
-            logger.error(`Network error on ${tweetId}`, { error: networkErr.message });
+            logger.error('Network error', { tweetId, error: networkErr.message });
             recordFailure(failedMap, tweetId, `NETWORK: ${networkErr.message}`);
             safeWriteJSON(CONFIG.FAILED_FILE, failedMap, 'failed.json');
             circuitBreaker.recordError();
             await wait(5000 + jitter(2000));
-            // retry the same tweet
+            // Don't advance index — retry this tweet
             continue;
         }
 
-        // Update rate limits
+        // Update rate state from response headers
         rateState.update(result.headers);
 
-        // Handle response
+        // RESPONSE HANDLING
 
-        // Handle success
+        // SUCCESS
         if (result.ok) {
             completedSet.add(tweetId);
             queueCompleted({ id: tweetId, ts: Math.floor(Date.now() / 1000) });
             delete failedMap[tweetId];
 
-            sessionCount++;
+            sessionUnliked++;
+            processedCount++;
             pendingIndex++;
             staleQueryCount = 0;   // reset stale-query counter on success
             consec403 = 0;
@@ -805,24 +872,25 @@ async function runProcessor(creds) {
             checkpoint.lastTweetId = tweetId;
             checkpoint.queryId = CONFIG.QUERY_ID;
 
-            if (sessionCount % CONFIG.CHECKPOINT_EVERY_N === 0) {
-                // flush buffer and save checkpoint
+            if (processedCount % CONFIG.CHECKPOINT_EVERY_N === 0) {
+                // Flush completed buffer so checkpoint reflects on-disk state
                 flushCompletedBuffer();
                 saveCheckpoint(checkpoint);
 
-                // trim pending.json every 500 unlikes to keep it small
-                if (sessionCount % 500 === 0) {
+                // Rewrite pending.json every 500 to trim completed entries from it.
+                // This keeps the file size reasonable and speeds up future init calls.
+                if (processedCount % 500 === 0) {
                     const remaining = pendingArray.slice(pendingIndex);
                     safeWriteJSON(CONFIG.PENDING_FILE, remaining, 'pending.json');
-                    logger.info('Checkpoint + pending file trimmed', {
-                        session: sessionCount,
+                    logger.info('Checkpoint persisted; pending queue compacted', {
+                        processed: processedCount,
                         completed: completedSet.size,
                         remaining: remaining.length,
                         rate: rateState.describe(),
                     });
                 } else {
-                    logger.info('Checkpoint saved', {
-                        session: sessionCount,
+                    logger.info('Checkpoint persisted', {
+                        processed: processedCount,
                         completed: completedSet.size,
                         rate: rateState.describe(),
                     });
@@ -832,15 +900,15 @@ async function runProcessor(creds) {
             continue;
         }
 
-        // Handle 429 rate limit
+        // RATE LIMITED (429)
         if (result.status === 429) {
             const resetIn = Math.max(0, rateState.resetAt - Date.now() + CONFIG.RATE_RESET_BUFFER_MS);
             const resetMin = (resetIn / 60_000).toFixed(1);
             logger.warn(
-                `429 Too Many Requests — waiting ${resetMin} minutes for rate limit reset`,
-                { resetAt: new Date(rateState.resetAt).toISOString() }
+                'Rate limit (429) hit, backing off',
+                { resetAt: new Date(rateState.resetAt).toISOString(), waitMin: resetMin }
             );
-            // log wait progress
+            // Log status periodically during the wait
             let slept = 0;
             while (slept < resetIn && !shutdownRequested) {
                 const chunk = Math.min(30_000, resetIn - slept);
@@ -850,11 +918,11 @@ async function runProcessor(creds) {
                     logger.info(`Rate limit wait: ${Math.round((resetIn - slept) / 1000)}s remaining`);
                 }
             }
-            // retry the same tweet
+            // Don't advance index — retry same tweet after wait
             continue;
         }
 
-        // Handle 401 unauthorized
+        // AUTH FAILED (401)
         if (result.status === 401) {
             flushCompletedBuffer();
             saveCheckpoint(checkpoint);
@@ -863,7 +931,8 @@ async function runProcessor(creds) {
             process.exit(1);
         }
 
-        // 403 Forbidden - retry a few times before stopping
+        // CSRF / SESSION ISSUE (403)
+        // Retry several times with exponential backoff + jitter before aborting.
         if (result.status === 403) {
             consec403++;
             const backoffMs = Math.min(
@@ -871,13 +940,13 @@ async function runProcessor(creds) {
                 CONFIG.RETRY_BACKOFF_MAX_MS
             ) + jitter(CONFIG.RETRY_JITTER_MAX_MS);
 
-            logger.warn(`403 Forbidden (attempt ${consec403}/${CONFIG.MAX_403_RETRIES})`, {
+            logger.warn(`403 Forbidden: attempt ${consec403}/${CONFIG.MAX_403_RETRIES}`, {
                 body: result.raw.slice(0, 200),
                 backoffMs,
             });
 
             if (consec403 < CONFIG.MAX_403_RETRIES) {
-                // check if user updated cookies.json while running
+                // Try refreshing ct0 from cookies.json in case the user updated it externally
                 const freshCreds = readJSONSafe(CONFIG.COOKIES_FILE, null);
                 if (freshCreds?.cookies?.ct0 && freshCreds.cookies.ct0 !== creds.cookies.ct0) {
                     logger.info('ct0 refreshed from cookies.json');
@@ -887,11 +956,8 @@ async function runProcessor(creds) {
                 continue; // retry same tweet
             }
 
-            // too many 403 errors, exit
-            logger.error(
-                `403 persisted after ${CONFIG.MAX_403_RETRIES} retries. ` +
-                'Session or CSRF token is invalid. Update cookies.json and restart.'
-            );
+            // MAX_403_RETRIES exhausted
+            logger.error('CSRF/session token authentication failed repeatedly, aborting', { retries: CONFIG.MAX_403_RETRIES });
             logger.error('Run: node unliker.js run   (after updating cookies.json)');
             flushCompletedBuffer();
             saveCheckpoint(checkpoint);
@@ -899,23 +965,21 @@ async function runProcessor(creds) {
             process.exit(1);
         }
 
-        // reset 403 counter
+        // Reset 403 counter on any non-403 response
         consec403 = 0;
 
-        // Handle stale query ID
+        // STALE QUERY ID (400 / 404 + specific error codes)
         if (isStaleQueryIdError(result)) {
             staleQueryCount++;
-            logger.warn(`Possible stale queryId on ${tweetId} (${staleQueryCount}/3)`, {
-                status: result.status,
-                errors: result.errors,
-            });
+            logger.warn('Possible stale query ID detected', { tweetId, attempt: staleQueryCount });
 
             if (staleQueryCount >= 3) {
-                logger.warn('Confirmed stale queryId after 3 consecutive errors.');
+                logger.error('Stale query ID confirmed after 3 consecutive errors');
                 const newId = await promptNewQueryId();
                 if (newId) {
                     CONFIG.QUERY_ID = newId;
                     creds.queryId = newId;
+                    // Persist new queryId into cookies.json
                     const storedCreds = readJSONSafe(CONFIG.COOKIES_FILE, {});
                     storedCreds.queryId = newId;
                     safeWriteJSON(CONFIG.COOKIES_FILE, storedCreds, 'cookies.json');
@@ -923,77 +987,96 @@ async function runProcessor(creds) {
                     saveCheckpoint(checkpoint);
                     staleQueryCount = 0;
                     circuitBreaker.reset();
-                    logger.info('queryId updated. Resuming.');
+                    logger.info('Query ID updated, resuming execution');
                 } else {
-                    logger.error('No queryId provided. Saving state and stopping.');
+                    logger.error('No query ID provided; persisting state and aborting');
                     flushCompletedBuffer();
                     saveCheckpoint(checkpoint);
                     safeWriteJSON(CONFIG.FAILED_FILE, failedMap, 'failed.json');
                     process.exit(1);
                 }
             }
-            // retry
+            // Retry same tweet
             await wait(2000 + jitter(1000));
             continue;
         }
 
-        // Handle already unliked or missing tweet
+        // TWEET NOT FOUND / ALREADY UNLIKED (200 but not Done)
         if (result.status === 200 && !result.done) {
-            logger.debug(`Tweet ${tweetId} returned 200/not-Done RAW=${result.raw}`);
+            const errors = result.errors || [];
+            const isCode144 = errors.some(e => e.code === 144);
+            const isCode34 = errors.some(e => e.code === 34);
+
+            let note = 'noop';
+            if (isCode144) {
+                note = 'not_in_favorites';
+                sessionAlreadyAbsent++;
+                logger.info(`Tweet ${tweetId} not found in favorites (code 144)`);
+            } else if (isCode34) {
+                note = 'not_found';
+                sessionAlreadyAbsent++;
+                logger.info(`Tweet ${tweetId} not found/deleted (code 34)`);
+            } else {
+                sessionNoop++;
+                logger.warn(`Tweet ${tweetId} returned 200/not-Done (noop)`, { errors });
+            }
+
             completedSet.add(tweetId);
-            queueCompleted({ id: tweetId, ts: Math.floor(Date.now() / 1000), note: 'noop' });
+            queueCompleted({ id: tweetId, ts: Math.floor(Date.now() / 1000), note });
             pendingIndex++;
-            sessionCount++;
+            processedCount++;
             staleQueryCount = 0;
             circuitBreaker.reset();
             checkpoint.completedCount = completedSet.size;
             continue;
         }
 
-        // Handle other errors
-        logger.warn(`Unexpected response for ${tweetId}`, {
-            status: result.status,
-            body: result.raw.slice(0, 300),
-        });
+        // UNKNOWN / UNEXPECTED ERROR
+        logger.warn('Unexpected response structure', { tweetId, status: result.status, body: result.raw.slice(0, 100) });
         recordFailure(failedMap, tweetId, `HTTP_${result.status}: ${result.raw.slice(0, 100)}`);
         safeWriteJSON(CONFIG.FAILED_FILE, failedMap, 'failed.json');
         circuitBreaker.recordError();
         pendingIndex++;
-        sessionCount++;
+        sessionFailed++;
+        processedCount++;
         checkpoint.failedCount = Object.keys(failedMap).length;
     }
 
-    // Save everything before exiting
+    // Final flush and save
     flushCompletedBuffer();
     const remaining = pendingArray.slice(pendingIndex);
     safeWriteJSON(CONFIG.PENDING_FILE, remaining, 'pending.json');
     saveCheckpoint(checkpoint);
     safeWriteJSON(CONFIG.FAILED_FILE, failedMap, 'failed.json');
 
-    // clean up signal listeners
+    // Remove signal handlers we added
     process.removeAllListeners('SIGINT');
     process.removeAllListeners('SIGTERM');
 
-    logger.info('Run complete', {
-        sessionUnliked: sessionCount,
-        totalCompleted: completedSet.size,
+    logger.info('Run finished', {
+        unliked: sessionUnliked,
+        alreadyAbsent: sessionAlreadyAbsent,
+        noop: sessionNoop,
+        failed: sessionFailed,
+        completed: completedSet.size,
         remaining: remaining.length,
-        failed: Object.keys(failedMap).length,
+        failedQueueCount: Object.keys(failedMap).length,
         circuitOpen: circuitBreaker.isOpen(),
         shutdownByUser: shutdownRequested,
     });
 
     if (remaining.length === 0 && Object.keys(failedMap).length === 0) {
-        logger.info('All tweets unliked successfully.');
+        logger.info('All tweets processed successfully.');
     } else if (remaining.length > 0) {
-        logger.info('Run: node unliker.js run   to continue.');
+        logger.info('Run: node unliker.js run (to continue)');
     }
     if (Object.keys(failedMap).length > 0) {
-        logger.info('Run: node unliker.js retry-failed   to retry errored tweets.');
+        logger.info('Run: node unliker.js retry-failed (to retry failed tweets)');
     }
 }
 
-// Commands
+// COMMANDS
+
 async function cmdInit(args) {
     const likesFlag = args.indexOf('--likes');
     const cookiesFlag = args.indexOf('--cookies');
@@ -1017,35 +1100,35 @@ async function cmdInit(args) {
 
     fs.mkdirSync(CONFIG.STATE_DIR, { recursive: true });
 
-    // Parse archive
+    // Parse like.js
     console.log('Parsing like.js...');
     const allIds = parseLikeJs(likesFile);
     console.log(`Found ${allIds.length} unique tweet IDs.`);
 
-    // don't lose progress if re-initializing
+    // Load existing completed set to allow re-init without losing progress
     const completedSet = loadCompletedSet();
     const pending = allIds.filter((id) => !completedSet.has(id));
     console.log(`Already completed: ${completedSet.size}. Pending: ${pending.length}.`);
 
-    // copy cookies if in a different path
+    // Copy cookies to canonical path if different
     const canonicalCookies = path.resolve(CONFIG.COOKIES_FILE);
     if (path.resolve(cookiesFile) !== canonicalCookies) {
         fs.copyFileSync(cookiesFile, canonicalCookies);
         console.log(`Credentials copied to ${CONFIG.COOKIES_FILE}`);
     }
 
-    // restrict permissions
+    // Protect credentials file
     protectCredentialsFile(canonicalCookies);
 
-    // test load cookies
+    // Validate credentials
     const creds = loadCredentials();
     console.log(`Credentials loaded. queryId: ${creds.queryId}`);
 
-    // write initial pending queue
+    // Write pending.json
     atomicWriteJSON(CONFIG.PENDING_FILE, pending);
     console.log(`Wrote ${pending.length} IDs to ${CONFIG.PENDING_FILE}`);
 
-    // set initial checkpoint
+    // Update checkpoint
     const cp = loadCheckpoint();
     cp.queryId = creds.queryId;
     cp.updatedAt = new Date().toISOString();
@@ -1093,7 +1176,7 @@ async function cmdStatus() {
     const pending = readJSONSafe(CONFIG.PENDING_FILE, []);
     const failedMap = readJSONSafe(CONFIG.FAILED_FILE, {});
 
-    // count what's left to unlike
+    // Compute effective pending (what the run loop would actually process)
     const effectivePending = pending.filter((id) => !completedSet.has(id));
     const total = completedSet.size + effectivePending.length;
     const pct = total > 0 ? ((completedSet.size / total) * 100).toFixed(1) : '0.0';
@@ -1124,7 +1207,7 @@ async function cmdStatus() {
         });
     }
 
-    // calculate ETA based on speed of last 1000 unlikes
+    // ETA — computed from recent throughput in the completed log
     if (effectivePending.length > 0 && completedSet.size > 0 && fs.existsSync(CONFIG.COMPLETED_FILE)) {
         try {
             const raw = fs.readFileSync(CONFIG.COMPLETED_FILE, 'utf8');
@@ -1149,6 +1232,189 @@ async function cmdStatus() {
     console.log('');
 }
 
+async function cmdAnalytics() {
+    if (!fs.existsSync(CONFIG.LOG_FILE)) {
+        console.error(`Log file not found at ${CONFIG.LOG_FILE}`);
+        process.exit(1);
+    }
+
+    const fileStream = fs.createReadStream(CONFIG.LOG_FILE);
+    const rl = readline.createInterface({
+        input: fileStream,
+        crlfDelay: Infinity
+    });
+
+    let firstTimestamp = null;
+    let lastTimestamp = null;
+
+    let sessions = [];
+    let currentSession = null;
+    let totalAttempts = 0;
+    let totalRateLimitPauses = 0;
+    let totalRateLimitPauseTime = 0;
+
+    // Regex patterns
+    const logLineRegex = /^(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z)\s+\[(\w+)\s*\]\s+(.*)$/;
+    const startRunRegex = /Starting run(?:\.\.\.)?\s*(.*)$/;
+    const endRunRegex = /Run (?:complete|finished)\s*(.*)$/;
+    const longPauseRegex = /(?:pausing|waiting) ([\d.]+)\s*(?:minutes|m)/i;
+    const shortPauseRegex = /rate limit pause:\s*(\d+)s/i;
+    const attemptRegex = /(?:Tweet \d+ (?:returned|not found|already|not found\/deleted)|Network error|Unexpected response|403 Forbidden)/i;
+
+    let lastSessionLineTime = null;
+
+    for await (const line of rl) {
+        const match = logLineRegex.exec(line);
+        if (!match) continue;
+
+        const timestampStr = match[1];
+        const level = match[2];
+        const message = match[3];
+
+        const time = new Date(timestampStr).getTime();
+        if (isNaN(time)) continue;
+
+        if (!firstTimestamp) firstTimestamp = time;
+        lastTimestamp = time;
+
+        // Detect process boundaries or sleep periods by checking the gap between consecutive log lines.
+        // If the gap is > 5 minutes, we treat the previous session as implicitly ended before the gap.
+        if (currentSession && lastSessionLineTime) {
+            const gap = time - lastSessionLineTime;
+            if (gap > 5 * 60 * 1000) {
+                currentSession.end = lastSessionLineTime;
+                sessions.push(currentSession);
+                currentSession = null;
+            }
+        }
+
+        // Session handling
+        const startMatch = startRunRegex.exec(message);
+        if (startMatch) {
+            if (currentSession) {
+                // Previous session crashed or didn't end cleanly
+                currentSession.end = lastSessionLineTime || time;
+                sessions.push(currentSession);
+            }
+            currentSession = { start: time, end: null };
+        }
+
+        const endMatch = endRunRegex.exec(message);
+        if (endMatch && currentSession) {
+            currentSession.end = time;
+            sessions.push(currentSession);
+            currentSession = null;
+        }
+
+        if (currentSession) {
+            lastSessionLineTime = time;
+
+            // Check for rate-limit pauses inside active session
+            const longMatch = longPauseRegex.exec(message);
+            if (longMatch) {
+                const mins = parseFloat(longMatch[1]);
+                const ms = mins * 60 * 1000;
+                totalRateLimitPauseTime += ms;
+                totalRateLimitPauses++;
+            } else {
+                const shortMatch = shortPauseRegex.exec(message);
+                if (shortMatch) {
+                    const secs = parseInt(shortMatch[1], 10);
+                    const ms = secs * 1000;
+                    totalRateLimitPauseTime += ms;
+                    totalRateLimitPauses++;
+                }
+            }
+
+            // Check for tweet attempts
+            if (attemptRegex.test(message)) {
+                totalAttempts++;
+            }
+        }
+    }
+
+    // Handle last session if still active at EOF
+    if (currentSession) {
+        currentSession.end = lastSessionLineTime || lastTimestamp;
+        sessions.push(currentSession);
+    }
+
+    if (sessions.length === 0) {
+        console.log('No run sessions found in logs.');
+        return;
+    }
+
+    // Calculations
+    const wallClockDuration = lastTimestamp - firstTimestamp;
+    let totalExecutionTime = 0;
+    for (const session of sessions) {
+        totalExecutionTime += (session.end - session.start);
+    }
+
+    const offlineTime = Math.max(0, wallClockDuration - totalExecutionTime);
+    const activeProcessingTime = Math.max(0, totalExecutionTime - totalRateLimitPauseTime);
+
+    const completedSet = loadCompletedSet();
+    const totalCompleted = completedSet.size;
+
+    const activeCompleted = completedSet.activelyUnlikedCount || 0;
+    totalAttempts += activeCompleted;
+
+    // Throughputs
+    const activeThroughput = activeProcessingTime > 0 
+        ? (totalAttempts / (activeProcessingTime / 3600000)) 
+        : 0;
+    const realWorldThroughput = wallClockDuration > 0 
+        ? (totalCompleted / (wallClockDuration / 3600000)) 
+        : 0;
+    const avgRequestInterval = totalAttempts > 0 
+        ? (activeProcessingTime / totalAttempts) 
+        : 0;
+
+    // Formatter helpers
+    const formatDuration = (ms) => {
+        const seconds = Math.floor(ms / 1000) % 60;
+        const minutes = Math.floor(ms / (1000 * 60)) % 60;
+        const hours = Math.floor(ms / (1000 * 60 * 60)) % 24;
+        const days = Math.floor(ms / (1000 * 60 * 60 * 24));
+
+        const parts = [];
+        if (days > 0) parts.push(`${days}d`);
+        if (hours > 0) parts.push(`${hours}h`);
+        if (minutes > 0) parts.push(`${minutes}m`);
+        if (parts.length === 0 || seconds > 0) parts.push(`${seconds}s`);
+
+        return parts.join(' ');
+    };
+
+    console.log('\n════════════════════════════════════════════════════════════');
+    console.log('  X Unliker — Project Runtime Analytics');
+    console.log('════════════════════════════════════════════════════════════');
+    console.log(`  Project Span:             ${formatDuration(wallClockDuration)}`);
+    console.log(`    - First Log Entry:      ${new Date(firstTimestamp).toISOString()}`);
+    console.log(`    - Final Log Entry:      ${new Date(lastTimestamp).toISOString()}`);
+    console.log('');
+    console.log(`  Session Statistics:`);
+    console.log(`    - Run Sessions:         ${sessions.length}`);
+    console.log(`    - Total Execution Time: ${formatDuration(totalExecutionTime)}`);
+    console.log(`    - Offline Time:         ${formatDuration(offlineTime)}`);
+    console.log(`      (Intervals between run sessions)`);
+    console.log('');
+    console.log(`  Rate Limiting & Pauses:`);
+    console.log(`    - Rate-Limit Pauses:    ${totalRateLimitPauses}`);
+    console.log(`    - Total Paused Time:    ${formatDuration(totalRateLimitPauseTime)}`);
+    console.log(`    - Active Processing:    ${formatDuration(activeProcessingTime)}`);
+    console.log('');
+    console.log(`  Throughput & Efficiency:`);
+    console.log(`    - Total Attempts:       ${totalAttempts.toLocaleString()}`);
+    console.log(`    - Total Completed:      ${totalCompleted.toLocaleString()}`);
+    console.log(`    - Active Rate:          ${activeThroughput.toFixed(1)} tweets/hour`);
+    console.log(`    - Effective Rate:       ${realWorldThroughput.toFixed(1)} tweets/hour`);
+    console.log(`      (Overall rate across total project span)`);
+    console.log(`    - Avg Request Interval: ${avgRequestInterval.toFixed(0)} ms`);
+    console.log('════════════════════════════════════════════════════════════\n');
+}
+
 async function cmdRetryFailed() {
     const failedMap = readJSONSafe(CONFIG.FAILED_FILE, {});
     const pending = readJSONSafe(CONFIG.PENDING_FILE, []);
@@ -1159,7 +1425,8 @@ async function cmdRetryFailed() {
         return;
     }
 
-    // clear failure history and add back to the end of the queue
+    // Reset attempt counts.
+    // Append to END of queue so failed tweets don't block normal processing.
     toRetry.forEach((id) => { delete failedMap[id]; });
     const pendingSet = new Set(pending);
     const toAdd = toRetry.filter((id) => !pendingSet.has(id));
@@ -1210,7 +1477,8 @@ async function cmdReset() {
     console.log(`Run: node unliker.js init --likes ./like.js --cookies ./cookies.json`);
 }
 
-// Main
+// ENTRY POINT
+
 async function main() {
     const args = process.argv.slice(2);
     const cmd = args[0];
@@ -1220,6 +1488,7 @@ async function main() {
         case 'run': await cmdRun(args.slice(1)); break;
         case 'status': await cmdStatus(); break;
         case 'retry-failed': await cmdRetryFailed(); break;
+        case 'analytics': await cmdAnalytics(); break;
         case 'reset': await cmdReset(); break;
         default:
             console.log('Usage: node unliker.js <command> [options]');
@@ -1235,6 +1504,9 @@ async function main() {
             console.log('');
             console.log('  status');
             console.log('    Show current progress, rate, ETA, and failure summary.');
+            console.log('');
+            console.log('  analytics');
+            console.log('    Calculate historical runtime metrics and throughput from run.log.');
             console.log('');
             console.log('  retry-failed');
             console.log('    Move all failed tweets to the END of the pending queue.');

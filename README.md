@@ -140,6 +140,12 @@ You can check how many tweets are left and see an ETA based on your average proc
 node unliker.js status
 ```
 
+### 5. Runtime Analytics
+To view advanced execution statistics across all completed runs, including active processing time vs. idle/sleep gaps and rate limit pauses:
+```bash
+node unliker.js analytics
+```
+
 ---
 
 ## Commands Reference
@@ -149,6 +155,7 @@ node unliker.js status
   - `--dry-run`: Performs a simulated execution path.
   - `--max <number>`: Stops execution after successfully unliking the specified number of tweets. Handy for testing runs in smaller batches.
 - `status`: Reads log history and gives progress stats, remaining counts, and ETAs.
+- `analytics`: Reads `state/run.log` and `state/completed.ndjson` to calculate runtime metrics, active session times, rate limit pauses, and throughput.
 - `retry-failed`: If some tweets continuously throw errors (like a deleted tweet or bad connection), they are flagged as failed. Run this command to move them back to the end of the queue for another try.
 - `reset`: Archives all run history, logs, and checkpoints into a backup subdirectory under `state/` so you can re-run initialization from scratch.
 
